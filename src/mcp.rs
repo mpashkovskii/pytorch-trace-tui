@@ -69,6 +69,19 @@ pub struct SequenceParam {
     pub stage: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct KernelShapesParam {
+    /// Path to a `.pt.trace.json` or `.pt.trace.json.gz` file.
+    pub path: String,
+    /// Only kernels whose name contains this substring. Omit for all kernels.
+    pub name: Option<String>,
+    /// Rows to skip from the top of the ranking. Defaults to 0.
+    #[serde(default)]
+    pub offset: usize,
+    /// Max rows to return (capped by the server). Defaults to 100.
+    pub limit: Option<usize>,
+}
+
 #[tool_router(server_handler)]
 impl TraceMcpServer {
     #[tool(
@@ -135,6 +148,24 @@ impl TraceMcpServer {
     ) -> Result<String, String> {
         let trace = mcp_core::load(&p.path).map_err(|e| e.to_string())?;
         Ok(mcp_core::stage_summary_for(&trace, p.stream))
+    }
+
+    #[tool(
+        name = "kernel_shapes",
+        description = "CSV joining kernels with the CPU operator that launched them: kernel, op, calls, total_us, mean_us, input_dims, input_types, flops_per_call. One row per kernel name, operator and input shapes, sorted by total GPU time. Shapes and FLOPs need a trace captured with record_shapes and with_flops; kernels replayed from a CUDA/HIP graph have no launching operator, so their op and shape columns are empty. Optional `name` substring filter. Paginated by offset/limit."
+    )]
+    fn kernel_shapes(
+        &self,
+        Parameters(p): Parameters<KernelShapesParam>,
+    ) -> Result<String, String> {
+        let (trace, ops) = mcp_core::load_with_ops(&p.path).map_err(|e| e.to_string())?;
+        Ok(mcp_core::kernel_shapes_csv_for(
+            &trace,
+            &ops,
+            p.name.as_deref().unwrap_or(""),
+            p.offset,
+            p.limit,
+        ))
     }
 }
 

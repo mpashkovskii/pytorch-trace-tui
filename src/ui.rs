@@ -623,6 +623,7 @@ mod tests {
             shared_memory: None,
             registers_per_thread: None,
             correlation: None,
+            external_id: None,
             trace_id: 0,
         }
     }

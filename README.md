@@ -155,6 +155,18 @@ per-position **median** duration computed across every repetition of that block
 in the lane, so you can see the typical cost of a repeated phase at a glance.
 Press `Y` to copy the table (tab-separated, paste-ready into a spreadsheet).
 
+## Kernel shapes
+
+The timeline shows kernels with their timing but not the shapes they ran on: input shapes, dtypes and FLOPs live on the CPU operator (`cat: cpu_op`) that launched each kernel. `--kernel-shapes` joins every kernel with that operator and prints a CSV ranked by total GPU time, without opening the TUI:
+
+```bash
+pytorch-trace-tui --kernel-shapes my_trace.pt.trace.json.gz --top 30 [--name <substring>] > kernel_shapes.csv
+```
+
+Columns: `kernel, op, calls, total_us, mean_us, input_dims, input_types, flops_per_call`. There is one row per kernel name, launching operator and input shapes, so the same kernel at different shapes (decode and prefill batch sizes) gets separate rows. `--top` defaults to 50 (0 prints every row) and `--name` keeps only kernels whose name contains the substring. The number of kernels without a launching operator goes to stderr.
+
+Kineto links a kernel to its operator through `External id`, or through `correlation` to the runtime launch event (`cuda_runtime`, `hip_runtime`) that carries the `External id`. Shapes and FLOPs are only recorded when the trace is captured with `record_shapes=True` and `with_flops=True`. Kernels replayed from a CUDA or HIP graph map to the graph launch rather than to a model operator, so their `op` and shape columns are empty.
+
 ## Trace format
 
 Generate a compatible trace from PyTorch:
@@ -181,7 +193,7 @@ the chat:
 pytorch-trace-tui --mcp
 ```
 
-It exposes five read-only tools. Every list-returning tool is bounded by
+It exposes six read-only tools. Every list-returning tool is bounded by
 `offset`/`limit` (default 100, hard cap 1000) so a multi-gigabyte trace can't
 overflow the model's context:
 
@@ -192,6 +204,7 @@ overflow the model's context:
 | `lane_kernels_csv` | `path`, `stream`, `offset?`, `limit?`, `stage?` | per-stream kernel CSV incl. the `annotation` and `stage` columns; optional `stage` (`prefill`/`decode`/`mixed`) returns only matching kernels |
 | `kernel_sequence` | `path`, `stream`, `kernel_name`, `offset?`, `limit?`, `stage?` | the kernel block from a named kernel up to its next occurrence; optional `stage` filter |
 | `stage_summary` | `path`, `stream` | per-stage aggregate stats for a stream (kernel count, total and median duration) |
+| `kernel_shapes` | `path`, `name?`, `offset?`, `limit?` | the [kernel shapes](#kernel-shapes) CSV: each kernel joined with its launching CPU operator's input shapes, dtypes and FLOPs, ranked by total GPU time; optional `name` substring filter |
 
 The `stage` filters and `stage_summary` let you analyse **prefill** and
 **decode** phases separately — e.g. "give me only the decode kernels on stream

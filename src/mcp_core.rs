@@ -5,9 +5,9 @@
 //! unbounded dump from an 800MB / multi-million-kernel trace into their context.
 
 use crate::app::{annotation_for_kernel, csv_escape, stage_for_annotation_name};
-use crate::trace::{parse_trace, KernelEvent, Trace};
+use crate::trace::{parse_trace, parse_trace_with_ops, KernelEvent, OpIndex, Trace};
 use anyhow::Result;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 /// The vLLM iteration stage a kernel executes under, derived from the covering
@@ -400,9 +400,145 @@ pub fn stage_summary_for(trace: &Trace, stream: u64) -> String {
     out
 }
 
+/// One row of the kernel-to-operator join: a kernel name, the CPU operator that
+/// launched it, and that operator's input shapes, dtypes and FLOPs, with the
+/// GPU time of every call that shares them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapeRow {
+    pub kernel: String,
+    pub op: String,
+    pub input_dims: String,
+    pub input_types: String,
+    pub flops: String,
+    pub calls: usize,
+    pub total_dur: f64,
+}
+
+impl ShapeRow {
+    /// Everything but the timing: breaks ties in the ranking deterministically.
+    fn key(&self) -> (&str, &str, &str, &str, &str) {
+        (
+            &self.kernel,
+            &self.op,
+            &self.input_dims,
+            &self.input_types,
+            &self.flops,
+        )
+    }
+}
+
+/// Kernel shapes of a trace, ranked by total GPU time.
+#[derive(Debug, Clone)]
+pub struct KernelShapes {
+    pub rows: Vec<ShapeRow>,
+    /// Kernels matching the name filter.
+    pub kernels: usize,
+    /// Kernels without a launching operator, e.g. replayed from a CUDA/HIP graph.
+    pub unlinked: usize,
+}
+
+/// Joins every kernel whose name contains `name_filter` with the CPU operator
+/// that launched it, and groups them by kernel name, operator and input shapes:
+/// the same kernel at different shapes (decode vs prefill batch sizes) sits at
+/// a different point of the roofline. Rows are sorted by total GPU time.
+pub fn kernel_shapes(trace: &Trace, ops: &OpIndex, name_filter: &str) -> KernelShapes {
+    type Key<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
+    let mut groups: HashMap<Key, (usize, f64)> = HashMap::new();
+    let mut kernels = 0;
+    let mut unlinked = 0;
+    for k in trace
+        .kernels
+        .iter()
+        .filter(|k| k.name.contains(name_filter))
+    {
+        kernels += 1;
+        let op = ops.op_for(k);
+        if op.is_none() {
+            unlinked += 1;
+        }
+        let key = match op {
+            Some(op) => (
+                k.name.as_str(),
+                op.name.as_str(),
+                op.input_dims.as_deref().unwrap_or(""),
+                op.input_types.as_deref().unwrap_or(""),
+                op.flops.as_deref().unwrap_or(""),
+            ),
+            None => (k.name.as_str(), "", "", "", ""),
+        };
+        let g = groups.entry(key).or_default();
+        g.0 += 1;
+        g.1 += k.dur;
+    }
+    let mut rows: Vec<ShapeRow> = groups
+        .into_iter()
+        .map(
+            |((kernel, op, dims, types, flops), (calls, total_dur))| ShapeRow {
+                kernel: kernel.to_string(),
+                op: op.to_string(),
+                input_dims: dims.to_string(),
+                input_types: types.to_string(),
+                flops: flops.to_string(),
+                calls,
+                total_dur,
+            },
+        )
+        .collect();
+    rows.sort_by(|a, b| {
+        b.total_dur
+            .total_cmp(&a.total_dur)
+            .then_with(|| a.key().cmp(&b.key()))
+    });
+    KernelShapes {
+        rows,
+        kernels,
+        unlinked,
+    }
+}
+
+/// CSV of kernel shape rows: `kernel, op, calls, total_us, mean_us, input_dims,
+/// input_types, flops_per_call`.
+pub fn kernel_shapes_csv(rows: &[ShapeRow]) -> String {
+    let mut out =
+        String::from("kernel,op,calls,total_us,mean_us,input_dims,input_types,flops_per_call\n");
+    for r in rows {
+        out.push_str(&format!(
+            "{},{},{},{:.1},{:.2},{},{},{}\n",
+            csv_escape(&r.kernel),
+            csv_escape(&r.op),
+            r.calls,
+            r.total_dur,
+            r.total_dur / r.calls as f64,
+            csv_escape(&r.input_dims),
+            csv_escape(&r.input_types),
+            csv_escape(&r.flops),
+        ));
+    }
+    out
+}
+
+/// [`kernel_shapes_csv`] for one page of the ranking, bounded by `offset`/`limit`.
+pub fn kernel_shapes_csv_for(
+    trace: &Trace,
+    ops: &OpIndex,
+    name_filter: &str,
+    offset: usize,
+    limit: Option<usize>,
+) -> String {
+    let rows = kernel_shapes(trace, ops, name_filter).rows;
+    let start = offset.min(rows.len());
+    let end = start.saturating_add(effective_limit(limit)).min(rows.len());
+    kernel_shapes_csv(&rows[start..end])
+}
+
 /// Loads a trace from disk (`.json` or `.json.gz`) for the MCP tools.
 pub fn load(path: &str) -> Result<Trace> {
     parse_trace(path)
+}
+
+/// Loads a trace together with its CPU operators, for [`kernel_shapes`].
+pub fn load_with_ops(path: &str) -> Result<(Trace, OpIndex)> {
+    parse_trace_with_ops(path)
 }
 
 #[cfg(test)]
@@ -423,6 +559,7 @@ mod tests {
             shared_memory: None,
             registers_per_thread: None,
             correlation: None,
+            external_id: None,
             trace_id: 0,
         }
     }
@@ -669,6 +806,111 @@ mod tests {
         assert_eq!(*decode, "decode\t3\t9.00\t3.00");
         let prefill = lines.iter().find(|l| l.starts_with("prefill\t")).unwrap();
         assert_eq!(*prefill, "prefill\t2\t6.00\t3.00");
+    }
+
+    fn op(name: &str, dims: &str) -> crate::trace::CpuOp {
+        crate::trace::CpuOp {
+            name: name.into(),
+            input_dims: Some(dims.into()),
+            input_types: Some(r#"["c10::BFloat16"]"#.into()),
+            flops: Some("100".into()),
+        }
+    }
+
+    /// gemm at two shapes (decode and prefill), a norm linked through its
+    /// runtime launch, and a graph-replayed kernel without an operator.
+    fn shapes_trace() -> (Trace, OpIndex) {
+        let link = |k: KernelEvent, ext: Option<u64>, corr: Option<u64>| KernelEvent {
+            external_id: ext,
+            correlation: corr,
+            ..k
+        };
+        let kernels = vec![
+            link(kd(4, 0.0, "gemm", 2.0), Some(1), None),
+            link(kd(4, 10.0, "gemm", 4.0), Some(1), None),
+            link(kd(4, 20.0, "gemm", 30.0), Some(2), None),
+            link(kd(4, 60.0, "norm", 1.0), None, Some(50)),
+            link(kd(4, 70.0, "replayed", 7.0), None, Some(51)),
+        ];
+        let mut ops = OpIndex::default();
+        ops.ops.insert(1, op("aten::mm", "[[16,64],[64,32]]"));
+        ops.ops.insert(2, op("aten::mm", "[[4096,64],[64,32]]"));
+        ops.ops.insert(3, op("vllm::rms_norm", "[[16,64]]"));
+        ops.launches.insert(50, 3);
+        (
+            Trace {
+                kernels,
+                annotations: vec![],
+            },
+            ops,
+        )
+    }
+
+    #[test]
+    fn test_kernel_shapes_groups_by_shape_and_ranks_by_time() {
+        let (t, ops) = shapes_trace();
+        let s = kernel_shapes(&t, &ops, "");
+        assert_eq!(s.kernels, 5);
+        assert_eq!(s.unlinked, 1);
+        let summary: Vec<(&str, &str, &str, usize, f64)> = s
+            .rows
+            .iter()
+            .map(|r| {
+                (
+                    r.kernel.as_str(),
+                    r.op.as_str(),
+                    r.input_dims.as_str(),
+                    r.calls,
+                    r.total_dur,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("gemm", "aten::mm", "[[4096,64],[64,32]]", 1, 30.0),
+                ("replayed", "", "", 1, 7.0),
+                ("gemm", "aten::mm", "[[16,64],[64,32]]", 2, 6.0),
+                ("norm", "vllm::rms_norm", "[[16,64]]", 1, 1.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_kernel_shapes_name_filter() {
+        let (t, ops) = shapes_trace();
+        let s = kernel_shapes(&t, &ops, "gem");
+        assert_eq!(s.kernels, 3);
+        assert_eq!(s.unlinked, 0);
+        assert!(s.rows.iter().all(|r| r.kernel == "gemm"));
+    }
+
+    #[test]
+    fn test_kernel_shapes_csv_columns_and_escaping() {
+        let (t, ops) = shapes_trace();
+        let csv = kernel_shapes_csv(&kernel_shapes(&t, &ops, "").rows);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(
+            lines[0],
+            "kernel,op,calls,total_us,mean_us,input_dims,input_types,flops_per_call"
+        );
+        assert_eq!(
+            lines[3],
+            r#"gemm,aten::mm,2,6.0,3.00,"[[16,64],[64,32]]","[""c10::BFloat16""]",100"#
+        );
+        assert_eq!(lines[2], "replayed,,1,7.0,7.00,,,");
+    }
+
+    #[test]
+    fn test_kernel_shapes_csv_for_paginates() {
+        let (t, ops) = shapes_trace();
+        let page = kernel_shapes_csv_for(&t, &ops, "", 1, Some(2));
+        let lines: Vec<&str> = page.lines().collect();
+        assert_eq!(lines.len(), 3, "header + 2 rows");
+        assert!(lines[1].starts_with("replayed,"));
+        assert!(lines[2].starts_with("gemm,"));
+        let past_end = kernel_shapes_csv_for(&t, &ops, "", 99, None);
+        assert_eq!(past_end.lines().count(), 1, "header only");
     }
 
     fn unique_tmp(tag: &str) -> std::path::PathBuf {

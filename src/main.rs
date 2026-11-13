@@ -42,6 +42,24 @@ struct Cli {
     #[arg(long, value_name = "TRACE_ID")]
     trace_id: Option<usize>,
 
+    /// Print a CSV joining each kernel with the CPU operator that launched it
+    /// (input shapes, dtypes, FLOPs), ranked by total GPU time, and exit.
+    #[arg(long)]
+    kernel_shapes: bool,
+
+    /// With --kernel-shapes: only kernels whose name contains this substring.
+    #[arg(long, value_name = "SUBSTRING", requires = "kernel_shapes")]
+    name: Option<String>,
+
+    /// With --kernel-shapes: rows to print (0 = all).
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 50,
+        requires = "kernel_shapes"
+    )]
+    top: usize,
+
     /// Run as a Model Context Protocol (MCP) server over stdio instead of the
     /// TUI, exposing read-only bounded trace-analysis tools to an AI assistant.
     #[arg(long)]
@@ -58,6 +76,10 @@ fn main() -> Result<()> {
     if cli.mcp {
         let rt = tokio::runtime::Runtime::new().context("failed to start async runtime")?;
         return rt.block_on(mcp::serve());
+    }
+
+    if cli.kernel_shapes {
+        return print_kernel_shapes(&cli.traces, cli.name.as_deref().unwrap_or(""), cli.top);
     }
 
     let paths: Vec<String> = if cli.traces.is_empty() {
@@ -122,6 +144,28 @@ fn dump_lane_csv(mut app: App, stream: u64, trace_id: Option<usize>) -> Result<(
         .lane_kernels_csv()
         .context("selected lane produced no CSV")?;
     print!("{}", csv);
+    Ok(())
+}
+
+/// Headless kernel shapes: prints the top `top` rows (0 = all) of the
+/// kernel-to-operator join of a single trace as CSV to stdout, and the count of
+/// kernels without a launching operator to stderr.
+fn print_kernel_shapes(paths: &[String], name_filter: &str, top: usize) -> Result<()> {
+    let [path] = paths else {
+        bail!("--kernel-shapes takes exactly one trace file");
+    };
+    let (trace, ops) =
+        mcp_core::load_with_ops(path).with_context(|| format!("Failed to load trace: {}", path))?;
+    let shapes = mcp_core::kernel_shapes(&trace, &ops, name_filter);
+    let rows = match top {
+        0 => &shapes.rows[..],
+        n => &shapes.rows[..n.min(shapes.rows.len())],
+    };
+    print!("{}", mcp_core::kernel_shapes_csv(rows));
+    eprintln!(
+        "{} kernels, {} without a launching operator",
+        shapes.kernels, shapes.unlinked
+    );
     Ok(())
 }
 
