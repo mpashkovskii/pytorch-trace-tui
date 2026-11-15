@@ -2,9 +2,13 @@
 //! trace-analysis tools over stdio, so an AI assistant can inspect PyTorch
 //! profiler traces without a human driving the TUI.
 //!
-//! Every tool delegates to the pure cores in [`crate::mcp_core`], which enforce
-//! `limit`/`offset` bounds — traces are 800MB+ / millions of kernels, so an
-//! unbounded dump would overflow the caller's context.
+//! The tools are centred on vLLM execution stages (`prefill`, `decode`,
+//! `mixed`): listing a stage's execution steps, reading the kernel sequence
+//! inside one step, collapsing per-step kernel sequences into patterns with
+//! the repeating per-layer block detected, and aggregating kernel shapes per
+//! stage. Every tool delegates to the pure cores in [`crate::mcp_core`], which
+//! enforce `limit`/`offset` bounds — traces are 800MB+ / millions of kernels,
+//! so an unbounded dump would overflow the caller's context.
 
 use crate::mcp_core;
 use crate::mcp_core::Stage;
@@ -17,68 +21,90 @@ use serde::Deserialize;
 #[derive(Debug, Clone)]
 pub struct TraceMcpServer;
 
-/// Maps an optional stage filter string to `Option<Stage>`, rejecting values
-/// other than prefill/decode/mixed. Absent means "no filter" (all stages).
-fn parse_stage_filter(stage: &Option<String>) -> Result<Option<Stage>, String> {
-    stage.as_deref().map(Stage::parse_arg).transpose()
+fn stage_arg(s: &str) -> Result<Stage, String> {
+    Stage::parse_arg(s)
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct PathParam {
-    /// Path to a `.pt.trace.json` or `.pt.trace.json.gz` file.
+pub struct StageStepsParam {
+    /// Path to a `.pt.trace.json` or `.pt.trace.json.gz` file (e.g. one
+    /// returned by `list_traces`).
     pub path: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct StageSummaryParam {
-    /// Path to a `.pt.trace.json` or `.pt.trace.json.gz` file.
-    pub path: String,
-    /// CUDA stream id to aggregate per-stage stats for.
-    pub stream: u64,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct LaneParam {
-    /// Path to a `.pt.trace.json` or `.pt.trace.json.gz` file.
-    pub path: String,
-    /// CUDA stream id whose kernel lane to export.
-    pub stream: u64,
-    /// Rows to skip from the start of the lane. Defaults to 0.
+    /// Which execution stage: `prefill`, `decode`, or `mixed`.
+    pub stage: String,
+    /// CUDA stream id. Omit to use the stream with the most kernel time; the
+    /// output header reports which stream was used (`stream=N(auto)`).
+    pub stream: Option<u64>,
+    /// Rows to skip over the stage's step list. Defaults to 0.
     #[serde(default)]
     pub offset: usize,
-    /// Max rows to return (capped by the server). Defaults to 100.
+    /// Max rows to return (default 100, hard cap 1000). The header's `total=`
+    /// is the number of steps, so you know whether to keep paging.
     pub limit: Option<usize>,
-    /// Optional stage filter: prefill, decode, or mixed. Omit for all kernels.
-    pub stage: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct SequenceParam {
+pub struct StepKernelsParam {
     /// Path to a `.pt.trace.json` or `.pt.trace.json.gz` file.
     pub path: String,
-    /// CUDA stream id to scan.
-    pub stream: u64,
-    /// Kernel name that starts the sequence.
-    pub kernel_name: String,
-    /// Rows to skip from the start of the sequence. Defaults to 0.
+    /// Which execution stage: `prefill`, `decode`, or `mixed`.
+    pub stage: String,
+    /// Which step: the `idx` column value from `stage_steps` (0-based index
+    /// into the stage's steps on the stream, ordered by time).
+    pub step: usize,
+    /// CUDA stream id. Omit to use the stream with the most kernel time; the
+    /// output header reports which stream was used (`stream=N(auto)`).
+    pub stream: Option<u64>,
+    /// Kernels to skip before the first returned row. Defaults to 0.
     #[serde(default)]
     pub offset: usize,
-    /// Max rows to return (capped by the server). Defaults to 100.
+    /// Max rows to return (default 100, hard cap 1000). The header's `total=`
+    /// is the number of kernels in the step, so you know whether to keep
+    /// paging.
     pub limit: Option<usize>,
-    /// Optional stage filter: prefill, decode, or mixed. Omit for all kernels.
-    pub stage: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct KernelShapesParam {
+pub struct StagePatternsParam {
     /// Path to a `.pt.trace.json` or `.pt.trace.json.gz` file.
     pub path: String,
-    /// Only kernels whose name contains this substring. Omit for all kernels.
+    /// Which execution stage: `prefill`, `decode`, or `mixed`.
+    pub stage: String,
+    /// CUDA stream id. Omit to use the stream with the most kernel time; the
+    /// output header reports which stream was used (`stream=N(auto)`).
+    pub stream: Option<u64>,
+    /// Optional: a `pattern` index from the list mode. With it, returns the
+    /// per-position detail of that pattern (per-position median durations and
+    /// most common launch/operator/input shape; the repeating per-layer block
+    /// collapsed to one copy). Without it, returns one row per pattern: steps
+    /// whose kernel-name sequences are identical, collapsed with a count,
+    /// median total duration, and the detected repeat block.
+    pub pattern: Option<usize>,
+    /// Rows to skip. Defaults to 0.
+    #[serde(default)]
+    pub offset: usize,
+    /// Max rows to return (default 100, hard cap 1000). The header's `total=`
+    /// is the full row count, so you know whether to keep paging.
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StageShapesParam {
+    /// Path to a `.pt.trace.json` or `.pt.trace.json.gz` file.
+    pub path: String,
+    /// Which execution stage: `prefill`, `decode`, or `mixed`.
+    pub stage: String,
+    /// CUDA stream id. Omit to use the stream with the most kernel time; the
+    /// output header reports which stream was used (`stream=N(auto)`).
+    pub stream: Option<u64>,
+    /// Only kernels whose name contains this substring. Defaults to all
+    /// kernels of the stage.
     pub name: Option<String>,
-    /// Rows to skip from the top of the ranking. Defaults to 0.
+    /// Rows to skip over the ranked shape rows. Defaults to 0.
     #[serde(default)]
     pub offset: usize,
-    /// Max rows to return (capped by the server). Defaults to 100.
+    /// Max rows to return (default 100, hard cap 1000). The header's `total=`
+    /// is the full row count, so you know whether to keep paging.
     pub limit: Option<usize>,
 }
 
@@ -86,7 +112,7 @@ pub struct KernelShapesParam {
 impl TraceMcpServer {
     #[tool(
         name = "list_traces",
-        description = "List PyTorch profiler traces (*.pt.trace.json.gz) in the current directory."
+        description = "List PyTorch profiler traces (*.pt.trace.json.gz) found recursively under the current directory as paths relative to it. Each path is directly reusable as the `path` argument of the other tools."
     )]
     fn list_traces(&self) -> Result<String, String> {
         let names = mcp_core::list_traces_in_dir(".").map_err(|e| e.to_string())?;
@@ -94,78 +120,59 @@ impl TraceMcpServer {
     }
 
     #[tool(
-        name = "summary",
-        description = "Aggregate overview of a trace: kernel/annotation counts, streams, and total duration. Never returns per-kernel rows."
+        name = "stage_steps",
+        description = "TSV list of a stage's (prefill|decode|mixed) execution steps on a stream of a trace: one row per vLLM step annotation with its name, the GPU span of the step's kernels as start/duration (µs), token counters parsed from the annotation name, `kernels` launched under the step's annotation, and `post_kernels` launched after it closed and before the next step started (vLLM launches its sampler and LM head there). Token columns: ctx_tokens/gen_tokens are scheduled query tokens (context/prefill and generation/decode side); on traces captured with detailed_trace_annotation, ctx_kv_tokens/gen_kv_tokens (sum of attended sequence lengths, the KV volume attention reads) and ctx_qk/gen_qk (sum of query_len × seq_len, proportional to attention FLOPs) are populated too, and empty on simple annotations. Membership is by launch (`membership=launch` in the header): a kernel belongs to the step whose CPU-side annotation contains its launch call, so eager steps whose GPU annotation covers only part of their kernels still report all of them; it falls back to the GPU window (`membership=gpu_window`) when the trace has no CPU-side step annotations. First line is `# ... total=N` (number of steps), then a column header; page with offset/limit. Omit `stream` to use the stream with the most kernel time (reported as `stream=N(auto)`). Use the `idx` values as the `step` argument of `step_kernels`."
     )]
-    fn summary(&self, Parameters(p): Parameters<PathParam>) -> Result<String, String> {
-        let trace = mcp_core::load(&p.path).map_err(|e| e.to_string())?;
-        let s = mcp_core::summary(&trace);
-        serde_json::to_string_pretty(&s).map_err(|e| e.to_string())
-    }
-
-    #[tool(
-        name = "lane_kernels_csv",
-        description = "CSV of kernels on one CUDA stream, including the covering annotation and derived prefill/decode/mixed stage. Optional `stage` filter (prefill|decode|mixed) returns only matching kernels. Paginated by offset/limit."
-    )]
-    fn lane_kernels_csv(
-        &self,
-        Parameters(p): Parameters<LaneParam>,
-    ) -> Result<String, String> {
-        let stage = parse_stage_filter(&p.stage)?;
-        let trace = mcp_core::load(&p.path).map_err(|e| e.to_string())?;
-        Ok(mcp_core::lane_kernels_csv_for(
-            &trace, p.stream, p.offset, p.limit, stage,
-        ))
-    }
-
-    #[tool(
-        name = "kernel_sequence",
-        description = "Tab-separated kernel sequence on a stream from the first kernel of the given name up to the next occurrence of that name. Optional `stage` filter (prefill|decode|mixed) restricts rows to that stage. Paginated by offset/limit."
-    )]
-    fn kernel_sequence(
-        &self,
-        Parameters(p): Parameters<SequenceParam>,
-    ) -> Result<String, String> {
-        let stage = parse_stage_filter(&p.stage)?;
-        let trace = mcp_core::load(&p.path).map_err(|e| e.to_string())?;
-        Ok(mcp_core::kernel_sequence_for(
-            &trace,
-            p.stream,
-            &p.kernel_name,
-            p.offset,
-            p.limit,
-            stage,
-        ))
-    }
-
-    #[tool(
-        name = "stage_summary",
-        description = "Per-stage aggregate stats for one CUDA stream: kernel count, total duration, and median duration for each of prefill/decode/mixed/none present on the stream."
-    )]
-    fn stage_summary(
-        &self,
-        Parameters(p): Parameters<StageSummaryParam>,
-    ) -> Result<String, String> {
-        let trace = mcp_core::load(&p.path).map_err(|e| e.to_string())?;
-        Ok(mcp_core::stage_summary_for(&trace, p.stream))
-    }
-
-    #[tool(
-        name = "kernel_shapes",
-        description = "CSV joining kernels with the CPU operator that launched them: kernel, op, calls, total_us, mean_us, input_dims, input_types, flops_per_call. One row per kernel name, operator and input shapes, sorted by total GPU time. Shapes and FLOPs need a trace captured with record_shapes and with_flops; kernels replayed from a CUDA/HIP graph have no launching operator, so their op and shape columns are empty. Optional `name` substring filter. Paginated by offset/limit."
-    )]
-    fn kernel_shapes(
-        &self,
-        Parameters(p): Parameters<KernelShapesParam>,
-    ) -> Result<String, String> {
+    fn stage_steps(&self, Parameters(p): Parameters<StageStepsParam>) -> Result<String, String> {
+        let stage = stage_arg(&p.stage)?;
         let (trace, ops) = mcp_core::load_with_ops(&p.path).map_err(|e| e.to_string())?;
-        Ok(mcp_core::kernel_shapes_csv_for(
+        mcp_core::stage_steps_tsv(&trace, &ops, stage, p.stream, p.offset, p.limit)
+    }
+
+    #[tool(
+        name = "step_kernels",
+        description = "TSV of the ordered kernel sequence inside one execution step of a stage (`step` is an `idx` from `stage_steps`). One row per kernel: pos, name, part (`step` when launched under the step's annotation, `post` when launched after it closed and before the next step started — vLLM's sampler and LM head land here), start_offset from step start, duration, gap to the previous kernel's end (µs), grid, block, launch (`op` when launched by a CPU operator, `graph` when replayed from a CUDA/HIP graph, empty when unlinked), and for operator launches the operator and its input_dims, input_types and flops per call (present only in traces captured with record_shapes / with_flops). Rows are in launch order, so consecutive gaps show idle time inside the step and repeating row runs show per-layer structure. First lines are `# ... total=N` (kernels in the step), then a column header; page with offset/limit. Omit `stream` to default to the stream with the most kernel time."
+    )]
+    fn step_kernels(&self, Parameters(p): Parameters<StepKernelsParam>) -> Result<String, String> {
+        let stage = stage_arg(&p.stage)?;
+        let (trace, ops) = mcp_core::load_with_ops(&p.path).map_err(|e| e.to_string())?;
+        mcp_core::step_kernels_tsv(&trace, &ops, stage, p.stream, p.step, p.offset, p.limit)
+    }
+
+    #[tool(
+        name = "stage_patterns",
+        description = "Condensed view of a stage (prefill|decode|mixed) on a stream. Without `pattern`: TSV with one row per distinct kernel-name sequence across the stage's steps (the per-step sequence includes post-step kernels — those launched after the step's annotation closed and before the next step started) — steps with identical sequences collapsed into one pattern, ranked by total kernel time, with their step count, kernels per step, median total duration, the detected repeating block (`start..end xcount`, typically the per-layer block) and the first step indices. With `pattern=N`: TSV detail of that pattern — one row per sequence position with the median duration and the most common launch/operator/input shape across the pattern's steps (`shape_varies` marks positions whose shape differs between steps), and the repeat block collapsed to a single copy (part=repeat, one layer's kernels, samples = steps × repeats) so one layer can be read without paging through all of them. `#`-prefixed header lines carry the stream used, the membership mode and `total=` row counts."
+    )]
+    fn stage_patterns(
+        &self,
+        Parameters(p): Parameters<StagePatternsParam>,
+    ) -> Result<String, String> {
+        let stage = stage_arg(&p.stage)?;
+        let (trace, ops) = mcp_core::load_with_ops(&p.path).map_err(|e| e.to_string())?;
+        match p.pattern {
+            None => mcp_core::stage_patterns_tsv(&trace, &ops, stage, p.stream, p.offset, p.limit),
+            Some(pattern) => mcp_core::stage_pattern_detail_tsv(
+                &trace, &ops, stage, p.stream, pattern, p.offset, p.limit,
+            ),
+        }
+    }
+
+    #[tool(
+        name = "stage_shapes",
+        description = "TSV of the kernel shapes of one stage (prefill|decode|mixed): one row per kernel name × launching operator × input dims × input types, ranked by total GPU time in the stage. Columns: kernel, op, calls, total_us, mean_us, share_pct (share of the stage's kernel time on the stream), input_dims, input_types, flops_per_call (present only in traces captured with record_shapes / with_flops). The same kernel at different shapes (decode vs prefill batch sizes) gets separate rows because it sits at a different point of the roofline. Kernels replayed from a CUDA/HIP graph are aggregated as op `(graph)` so their time share stays visible; their shapes come from the model config and the step's tokens instead. Kernels launched after a step's annotation closed and before the next step started (vLLM's sampler and LM head) are included as that step's post-step work. The `#` header reports coverage: kernels in the stage, how many of them post-step, how many with shapes, graph-replayed and unlinked, plus stage_kernel_us (the share_pct denominator), and total= row count for paging with offset/limit. Filter kernel names with `name`. Omit `stream` to default to the stream with the most kernel time."
+    )]
+    fn stage_shapes(&self, Parameters(p): Parameters<StageShapesParam>) -> Result<String, String> {
+        let stage = stage_arg(&p.stage)?;
+        let (trace, ops) = mcp_core::load_with_ops(&p.path).map_err(|e| e.to_string())?;
+        mcp_core::stage_shapes_tsv(
             &trace,
             &ops,
+            stage,
+            p.stream,
             p.name.as_deref().unwrap_or(""),
             p.offset,
             p.limit,
-        ))
+        )
     }
 }
 

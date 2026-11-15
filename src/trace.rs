@@ -15,6 +15,7 @@ const KEEP_CATS_BYTES: &[&[u8]] = &[
     b"gpu_user_annotation",
 ];
 const CPU_OP_CAT: &str = "cpu_op";
+const CPU_ANNOTATION_CAT: &str = "user_annotation";
 const RUNTIME_CATS: &[&str] = &["cuda_runtime", "hip_runtime", "cuda_driver", "hip_driver"];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,15 +89,54 @@ pub struct CpuOp {
     pub flops: Option<String>,
 }
 
-/// The CPU side needed to find the operator that launched a kernel. Kineto
-/// links a kernel to its operator through `External id`, or through
-/// `correlation` to the runtime launch event that carries the `External id`.
+/// A CPU-side annotation (`cat: user_annotation`), e.g. vLLM's per-step
+/// `execute_context_<n>(<tok>)_generation_<m>(<tok>)`. Its start/end are CPU
+/// wall-clock: for eager steps the kernels' launch calls sit inside it, while
+/// the corresponding GPU-side annotation can cover only a fraction of them
+/// once launches outrun the GPU.
+#[derive(Debug, Clone)]
+pub struct CpuAnnotationEvent {
+    pub name: String,
+    pub ts: f64,
+    pub dur: f64,
+    /// The CPU process; runtime launch events of the same process carry the
+    /// same pid, which is how a launch is attributed to an annotation.
+    pub pid: u64,
+}
+
+impl CpuAnnotationEvent {
+    pub fn end_ts(&self) -> f64 {
+        self.ts + self.dur
+    }
+}
+
+/// A runtime API event (`cuda_runtime`/`hip_runtime`/driver cats) keyed by
+/// correlation. Carries the launch time and process (for step attribution) and
+/// the `External id` of the calling operator when one exists. Graph replays
+/// (`hipGraphLaunch`, `cudaGraphLaunch`, `cuGraphLaunch`) have none: every
+/// kernel of one replay shares the graph launch's correlation.
+#[derive(Debug, Clone)]
+pub struct LaunchEvent {
+    pub ts: f64,
+    pub pid: u64,
+    pub external_id: Option<u64>,
+    /// The runtime call is a graph launch, so kernels with this correlation
+    /// run inside a CUDA/HIP graph replay and map to no CPU operator.
+    pub graph: bool,
+}
+
+/// The CPU side needed to find the operator that launched a kernel and the
+/// step a kernel was launched from. Kineto links a kernel to its operator
+/// through `External id`, or through `correlation` to the runtime launch event
+/// that carries the `External id`.
 #[derive(Debug, Clone, Default)]
 pub struct OpIndex {
     /// `External id` -> CPU operator.
     pub ops: HashMap<u64, CpuOp>,
-    /// `correlation` -> `External id` of the runtime launch event.
-    pub launches: HashMap<u64, u64>,
+    /// `correlation` -> the runtime event with that correlation.
+    pub launches: HashMap<u64, LaunchEvent>,
+    /// CPU-side annotations (`user_annotation`), sorted by ts.
+    pub cpu_annotations: Vec<CpuAnnotationEvent>,
 }
 
 impl OpIndex {
@@ -105,9 +145,14 @@ impl OpIndex {
         k.external_id
             .and_then(|ext| self.ops.get(&ext))
             .or_else(|| {
-                let ext = self.launches.get(&k.correlation?)?;
-                self.ops.get(ext)
+                let ext = self.launches.get(&k.correlation?)?.external_id?;
+                self.ops.get(&ext)
             })
+    }
+
+    /// The runtime event that launched `k`, by correlation.
+    pub fn launch_for(&self, k: &KernelEvent) -> Option<&LaunchEvent> {
+        self.launches.get(&k.correlation?)
     }
 }
 
@@ -132,7 +177,7 @@ fn parse_trace_file(path: &str, with_ops: bool) -> Result<(Trace, OpIndex)> {
     } else {
         ThreadedReader::new(progress)
     };
-    let (mut trace, ops) = parse_lexer(reader, with_ops).context("Failed to parse trace")?;
+    let (mut trace, mut ops) = parse_lexer(reader, with_ops).context("Failed to parse trace")?;
 
     progress_finish(total);
 
@@ -141,6 +186,8 @@ fn parse_trace_file(path: &str, with_ops: bool) -> Result<(Trace, OpIndex)> {
         .sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap_or(std::cmp::Ordering::Equal));
     trace
         .annotations
+        .sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap_or(std::cmp::Ordering::Equal));
+    ops.cpu_annotations
         .sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap_or(std::cmp::Ordering::Equal));
     Ok((trace, ops))
 }
@@ -498,8 +545,11 @@ impl EventLexer {
                     Some(Parsed::Op(ext, op)) => {
                         self.op_index.ops.insert(ext, op);
                     }
-                    Some(Parsed::Launch(correlation, ext)) => {
-                        self.op_index.launches.insert(correlation, ext);
+                    Some(Parsed::Launch(correlation, launch)) => {
+                        self.op_index.launches.insert(correlation, launch);
+                    }
+                    Some(Parsed::CpuAnnotation(a)) => {
+                        self.op_index.cpu_annotations.push(a);
                     }
                     None => {}
                 }
@@ -542,8 +592,11 @@ fn cat_in_header(buf: &[u8], with_ops: bool) -> Option<bool> {
         return None;
     }
     let val = &after[val_start..i];
-    let is_op_cat =
-        || val == CPU_OP_CAT.as_bytes() || RUNTIME_CATS.iter().any(|c| c.as_bytes() == val);
+    let is_op_cat = || {
+        val == CPU_OP_CAT.as_bytes()
+            || val == CPU_ANNOTATION_CAT.as_bytes()
+            || RUNTIME_CATS.iter().any(|c| c.as_bytes() == val)
+    };
     Some(KEEP_CATS_BYTES.contains(&val) || (with_ops && is_op_cat()))
 }
 
@@ -569,8 +622,10 @@ enum Parsed {
     Annotation(AnnotationEvent),
     /// A CPU operator and its `External id`.
     Op(u64, CpuOp),
-    /// A runtime launch: `correlation` and `External id`.
-    Launch(u64, u64),
+    /// A runtime event and its `correlation`.
+    Launch(u64, LaunchEvent),
+    /// A CPU-side annotation (`user_annotation`).
+    CpuAnnotation(CpuAnnotationEvent),
 }
 
 fn classify(e: RawEvent) -> Option<Parsed> {
@@ -596,8 +651,24 @@ fn classify(e: RawEvent) -> Option<Parsed> {
     }
     if RUNTIME_CATS.contains(&cat) {
         let correlation = args_u64(&e.args, "correlation")?;
-        let ext = args_u64(&e.args, "External id")?;
-        return Some(Parsed::Launch(correlation, ext));
+        let name = e.name.unwrap_or_default();
+        return Some(Parsed::Launch(
+            correlation,
+            LaunchEvent {
+                ts: e.ts?,
+                pid: tid_to_u64(&e.pid).unwrap_or(0),
+                external_id: args_u64(&e.args, "External id"),
+                graph: name.contains("GraphLaunch"),
+            },
+        ));
+    }
+    if cat == CPU_ANNOTATION_CAT {
+        return Some(Parsed::CpuAnnotation(CpuAnnotationEvent {
+            name: e.name.unwrap_or_else(|| "(unnamed)".to_string()),
+            ts: e.ts?,
+            dur: e.dur.unwrap_or(0.0),
+            pid: tid_to_u64(&e.pid).unwrap_or(0),
+        }));
     }
 
     let ts = e.ts?;
@@ -801,9 +872,11 @@ mod tests {
     }
 
     /// A kernel linked to its operator through `External id`, one linked only
-    /// through `correlation` to its runtime launch, and one graph-replayed
-    /// kernel with no operator.
+    /// through `correlation` to its runtime launch, a graph-replayed kernel
+    /// sharing the correlation of its `hipGraphLaunch`, and a CPU-side step
+    /// annotation around the launch calls.
     const OPS_TRACE: &str = r#"{"traceEvents":[
+        {"ph":"X","cat":"user_annotation","name":"execute_context_0(0)_generation_1(1)","pid":1,"tid":1,"ts":0.0,"dur":20.0},
         {"ph":"X","cat":"cpu_op","name":"aten::mm","pid":1,"tid":1,"ts":1.0,"dur":5.0,
          "args":{"External id":7,"Input Dims":[[16, 64], [64, 32]],
                  "Input type":["c10::BFloat16", "c10::BFloat16"],"flops":32768}},
@@ -811,6 +884,8 @@ mod tests {
          "args":{"External id":8}},
         {"ph":"X","cat":"cuda_runtime","name":"cudaLaunchKernel","pid":1,"tid":1,"ts":3.0,"dur":1.0,
          "args":{"External id":8,"correlation":42}},
+        {"ph":"X","cat":"hip_runtime","name":"hipGraphLaunch","pid":1,"tid":1,"ts":4.0,"dur":1.0,
+         "args":{"correlation":99}},
         {"ph":"X","cat":"python_function","name":"forward {\"x\": }","pid":1,"tid":1,"ts":0.5,"dur":9.0,
          "args":{"Python id":3}},
         {"ph":"X","cat":"kernel","name":"gemm","pid":0,"tid":7,"ts":10.0,"dur":3.0,
@@ -826,7 +901,11 @@ mod tests {
         let (trace, ops) = parse_lexer(BufReader::new(OPS_TRACE.as_bytes()), true).unwrap();
         assert_eq!(trace.kernels.len(), 3);
         assert_eq!(ops.ops.len(), 2);
-        assert_eq!(ops.launches.get(&42), Some(&8));
+        let launch = ops.launches.get(&42).expect("runtime launch kept");
+        assert_eq!(launch.external_id, Some(8));
+        assert!(!launch.graph);
+        assert!((launch.ts - 3.0).abs() < f64::EPSILON);
+        assert_eq!(launch.pid, 1);
 
         let gemm = ops
             .op_for(&trace.kernels[0])
@@ -849,11 +928,30 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_with_ops_keeps_cpu_annotations_and_graph_launches() {
+        let (trace, ops) = parse_lexer(BufReader::new(OPS_TRACE.as_bytes()), true).unwrap();
+        let _ = trace;
+        assert_eq!(ops.cpu_annotations.len(), 1);
+        let ann = &ops.cpu_annotations[0];
+        assert_eq!(ann.name, "execute_context_0(0)_generation_1(1)");
+        assert_eq!(ann.pid, 1);
+        assert!((ann.end_ts() - 20.0).abs() < f64::EPSILON);
+
+        // The graph launch has no External id but is kept, marked as a graph
+        // launch, and the replayed kernel launches through it.
+        let launch = ops.launch_for(&trace.kernels[2]).expect("graph launch kept");
+        assert!(launch.graph);
+        assert_eq!(launch.external_id, None);
+        assert!((launch.ts - 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn test_parse_without_ops_skips_cpu_events() {
         let (trace, ops) = parse_lexer(BufReader::new(OPS_TRACE.as_bytes()), false).unwrap();
         assert_eq!(trace.kernels.len(), 3);
         assert!(ops.ops.is_empty());
         assert!(ops.launches.is_empty());
+        assert!(ops.cpu_annotations.is_empty());
     }
 
     #[test]

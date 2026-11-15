@@ -193,22 +193,35 @@ the chat:
 pytorch-trace-tui --mcp
 ```
 
-It exposes six read-only tools. Every list-returning tool is bounded by
-`offset`/`limit` (default 100, hard cap 1000) so a multi-gigabyte trace can't
-overflow the model's context:
+It exposes five read-only tools, centred on the per-stage kernel sequences of
+vLLM traces. A kernel belongs to the vLLM step whose CPU-side step annotation
+contains the kernel's launch call (`membership=launch` in the output header;
+graph-replayed kernels are attributed through their graph launch the same way),
+so eager steps whose GPU-side annotation covers only a fraction of their
+kernels still report all of them. Kernels launched *after* a step's annotation
+closed and before the next step started — vLLM launches the sampler and the
+LM head there — are attributed to that step as post-step work (`part=post`,
+counted as `post_kernels`); kernels launched before the first step belong to
+no step. Traces without CPU-side step annotations fall back to the GPU-side
+window (`membership=gpu_window`), with the same post-step rule applied to the
+gap between windows. Every list-returning tool is bounded by `offset`/`limit`
+(default 100, hard cap 1000), emits compact TSV with a `#`-prefixed header
+line containing the total row count. Omitting `stream` defaults to the stream
+with the most kernel time, reported as `stream=N(auto)` in the header:
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
 | `list_traces` | — | relative paths of every `*.pt.trace.json.gz` found recursively under the working directory (e.g. `logs/<run>/traces/…`); each path is directly reusable as the `path` argument below |
-| `summary` | `path` | kernel/annotation counts, streams, duration, and a per-stage (prefill/decode/mixed/none) breakdown |
-| `lane_kernels_csv` | `path`, `stream`, `offset?`, `limit?`, `stage?` | per-stream kernel CSV incl. the `annotation` and `stage` columns; optional `stage` (`prefill`/`decode`/`mixed`) returns only matching kernels |
-| `kernel_sequence` | `path`, `stream`, `kernel_name`, `offset?`, `limit?`, `stage?` | the kernel block from a named kernel up to its next occurrence; optional `stage` filter |
-| `stage_summary` | `path`, `stream` | per-stage aggregate stats for a stream (kernel count, total and median duration) |
-| `kernel_shapes` | `path`, `name?`, `offset?`, `limit?` | the [kernel shapes](#kernel-shapes) CSV: each kernel joined with its launching CPU operator's input shapes, dtypes and FLOPs, ranked by total GPU time; optional `name` substring filter |
+| `stage_steps` | `path`, `stage`, `stream?`, `offset?`, `limit?` | the execution steps (`idx`, annotation name, GPU span as start/duration µs, token counts, `kernels` launched under the annotation, `post_kernels`) of a stage (`prefill`/`decode`/`mixed`) on a stream, ordered by time; token columns are `ctx_tokens`/`gen_tokens` (scheduled query tokens) plus — only on `detailed_trace_annotation` traces — `ctx_kv_tokens`/`gen_kv_tokens` (sum of attended sequence lengths) and `ctx_qk`/`gen_qk` (sum of query_len × seq_len, proportional to attention FLOPs) |
+| `step_kernels` | `path`, `stage`, `step`, `stream?`, `offset?`, `limit?` | the ordered kernel sequence inside one step (`step` = an `idx` from `stage_steps`): name, `part` (`step` when launched under the step's annotation, `post` for post-step work), start offset from step start, duration, gap to the previous kernel (µs), grid, block, launch kind (`op`/`graph`/`""`), and for operator launches the operator, input dims, input types and FLOPs per call |
+| `stage_patterns` | `path`, `stage`, `stream?`, `pattern?`, `offset?`, `limit?` | without `pattern`: steps collapsed into patterns by identical kernel-name sequence (step count, median total duration, detected repeating per-layer block, step indices); with `pattern=N`: per-position detail of that pattern, with the repeat block collapsed to one copy and the most common launch/operator/input shape at each position (`shape_varies` marks positions whose shape changes between steps) |
+| `stage_shapes` | `path`, `stage`, `stream?`, `name?`, `offset?`, `limit?` | the stage's kernel shapes for the roofline: one row per kernel × launching operator × input dims × input types, ranked by GPU time in the stage, with calls, total/mean µs, share of the stage's kernel time, and FLOPs per call; graph-replayed kernels aggregate as op `(graph)`, post-step kernels (sampler, LM head) are included in the stage, and the header reports coverage (`kernels` in the stage, `post_kernels`, `with_shapes`, `graph_replayed`, `unlinked`) |
 
-The `stage` filters and `stage_summary` let you analyse **prefill** and
-**decode** phases separately — e.g. "give me only the decode kernels on stream
-4" returns a bounded, pre-filtered result.
+A typical trajectory is: `stage_steps stage=decode` to find the steps, then
+`stage_patterns stage=decode` to collapse identical steps and see the per-layer
+repeat, then `step_kernels stage=decode step=N` for one concrete step's exact
+kernel sequence and gaps, and `stage_shapes stage=decode` for the per-shape
+ranking with FLOPs.
 
 ### Claude Code
 
